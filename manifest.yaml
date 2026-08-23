@@ -1,0 +1,17 @@
+manifestVersion: 1
+name: "@aaronge/obsidian-atlas"
+version: "2026.08.21.1"
+description: "Turn a Git repository or an architecture diagram into an illustrated, wikilinked Obsidian atlas using the local Claude CLI."
+
+repository: https://github.com/aaron-dernley/obsidian-atlas
+
+additionalFiles:
+  - README.md
+  - LICENSE
+
+models:
+  - obsidian_atlas.ts
+
+# Empty platforms means universal — the model only needs git, the Claude CLI,
+# and a vault directory, all of which exist on every supported platform.
+platforms: []

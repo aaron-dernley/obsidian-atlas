@@ -1,0 +1,27 @@
+# Example model instance for @aaronge/obsidian-atlas.
+#
+# Copy this to atlas.yaml and set vaultRoot to your own Obsidian vault, or just
+# run `swamp model create @aaronge/obsidian-atlas atlas` and edit the result.
+# atlas.yaml itself is gitignored so nobody publishes their personal vault path.
+
+type: '@aaronge/obsidian-atlas'
+name: atlas
+version: 1
+tags: {}
+
+globalArguments:
+  # Absolute path to your Obsidian vault. This is just the folder Obsidian
+  # opens — there is no account or API involved.
+  vaultRoot: /path/to/your/obsidian/vault
+
+  # Subfolder inside the vault that generated atlases are written to.
+  folder: Atlas
+
+  # Optional overrides, all shown with their defaults.
+  # claudeBin: claude          # Claude CLI executable, resolved on PATH
+  # model: claude-opus-5       # model override passed to the CLI
+  # workDir: /tmp/atlas        # where repositories are cloned
+  # permissionMode: dontAsk    # permission mode passed to the CLI
+  # timeoutSeconds: 900        # per-invocation wall-clock limit
+
+methods: {}
