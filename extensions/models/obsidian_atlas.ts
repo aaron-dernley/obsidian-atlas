@@ -1255,6 +1255,8 @@ interface Ctx {
     name: string,
     version?: number,
   ) => Promise<Record<string, unknown> | null>;
+  /** Removes every version of a stored resource. */
+  deleteResource?: (name: string) => Promise<void>;
   createFileWriter: (
     specName: string,
     name: string,
@@ -1287,6 +1289,12 @@ const ChartArgsSchema = z.object({
     .describe(
       "Re-chart even when this project is already charted at the same commit.",
     ),
+  prune: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Delete notes from a previous run that this run no longer produces.",
+    ),
 });
 
 const DiagramArgsSchema = z.object({
@@ -1299,31 +1307,49 @@ const DiagramArgsSchema = z.object({
     .string()
     .optional()
     .describe("Optional context about what the diagram shows."),
+  prune: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Delete notes from a previous run that this run no longer produces.",
+    ),
 });
 
 /**
- * Decide whether a project is already charted at a given commit.
+ * Read the atlas recorded by a previous run of this project, if any.
  *
- * Both halves have to hold: the recorded atlas must be for the same commit,
- * and every note it claims to have written must still be on disk. Data alone
- * is not enough — if the vault folder was deleted or moved, skipping would
- * leave the caller with no notes and no explanation.
+ * Read once and reused for both the already-charted check and orphan
+ * detection: the run overwrites this resource partway through, so reading it
+ * later would compare the new atlas against itself.
  *
  * @param context Method context, whose `readResource` may be unavailable.
  * @param project Vault subfolder name, used as the instance name suffix.
+ * @returns The stored atlas data, or null when there is none.
+ */
+async function previousAtlas(
+  context: Ctx,
+  project: string,
+): Promise<Record<string, unknown> | null> {
+  if (!context.readResource) return null;
+  return await context.readResource(`atlas-${project}`).catch(() => null);
+}
+
+/**
+ * Decide whether a recorded atlas already covers a given commit.
+ *
+ * Both halves have to hold: the atlas must be for the same commit, and every
+ * note it claims to have written must still be on disk. Data alone is not
+ * enough — if the vault folder was deleted or moved, skipping would leave the
+ * caller with no notes and no explanation.
+ *
+ * @param previous Atlas data from a previous run, or null.
  * @param commit Freshly resolved HEAD commit of the clone.
  * @returns True when charting can safely be skipped.
  */
-async function alreadyCharted(
-  context: Ctx,
-  project: string,
+async function isChartedAt(
+  previous: Record<string, unknown> | null,
   commit: string,
 ): Promise<boolean> {
-  if (!context.readResource) return false;
-
-  const previous = await context.readResource(`atlas-${project}`).catch(
-    () => null,
-  );
   if (!previous || previous.commit !== commit) return false;
 
   const notes = previous.notes;
@@ -1336,6 +1362,154 @@ async function alreadyCharted(
     if (!stat?.isFile) return false;
   }
   return true;
+}
+
+/** A note left behind by a previous run that the current run did not write. */
+export interface OrphanNote {
+  /** Slug, used to derive the stale `note` resource instance name. */
+  slug: string;
+  /** Absolute path of the markdown file on disk. */
+  path: string;
+}
+
+/**
+ * Find notes in this project's folder that the current run did not write.
+ *
+ * Ownership is decided by frontmatter, not by a stored list. Every note this
+ * model writes carries `atlas-project`, so a file bearing this project's marker
+ * that the current run did not produce is one of ours and is stale. A file
+ * without that marker was written by someone else and is never a candidate.
+ *
+ * Reading the folder rather than the previous atlas record matters: the record
+ * only describes the last run, so orphans left by earlier runs would accumulate
+ * forever. The folder is the actual state, and it heals a vault that has
+ * already drifted.
+ *
+ * Only markdown files sitting directly in the folder are considered — no
+ * recursion, so a subdirectory the user made is left alone.
+ *
+ * @param atlasDir Absolute path of this project's folder in the vault.
+ * @param project Vault subfolder name, matched against the frontmatter.
+ * @param writtenPaths Paths written by the current run.
+ * @returns Orphaned notes, sorted by path for stable logging.
+ */
+export async function findOrphans(
+  atlasDir: string,
+  project: string,
+  writtenPaths: ReadonlySet<string>,
+): Promise<OrphanNote[]> {
+  const marker = `atlas-project: ${yamlString(project)}`;
+  const orphans: OrphanNote[] = [];
+
+  let entries: Deno.DirEntry[];
+  try {
+    entries = [];
+    for await (const entry of Deno.readDir(atlasDir)) entries.push(entry);
+  } catch {
+    return [];
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile || !entry.name.endsWith(".md")) continue;
+    const path = `${atlasDir}/${entry.name}`;
+    if (writtenPaths.has(path)) continue;
+
+    const content = await Deno.readTextFile(path).catch(() => null);
+    if (content === null) continue;
+    // Check only the frontmatter block, so prose quoting the marker cannot
+    // make an unrelated note look like ours.
+    const end = content.indexOf("\n---", 4);
+    const frontmatter = content.startsWith("---\n") && end !== -1
+      ? content.slice(0, end)
+      : "";
+    if (!frontmatter.includes(marker)) continue;
+
+    orphans.push({ slug: entry.name.slice(0, -3), path });
+  }
+  return orphans.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/**
+ * Delete orphaned notes and the stale resources that described them.
+ *
+ * @param context Method context used to delete resources and log.
+ * @param project Vault subfolder name, used as the instance name suffix.
+ * @param orphans Notes identified by {@link findOrphans}.
+ * @returns The number of files actually removed.
+ */
+async function removeOrphans(
+  context: Ctx,
+  project: string,
+  orphans: readonly OrphanNote[],
+): Promise<number> {
+  let removed = 0;
+  for (const orphan of orphans) {
+    try {
+      await Deno.remove(orphan.path);
+      removed++;
+    } catch (err) {
+      context.logger.warning("Could not remove {path}: {detail}", {
+        path: orphan.path,
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    // The note resource describes a file that no longer exists, so drop it too
+    // rather than leaving `swamp data query` reporting phantom notes.
+    await context.deleteResource?.(`note-${project}-${orphan.slug}`).catch(
+      (err: unknown) =>
+        context.logger.warning(
+          "Removed {path} but its note resource remains: {detail}",
+          {
+            path: orphan.path,
+            detail: err instanceof Error ? err.message : String(err),
+          },
+        ),
+    );
+  }
+  return removed;
+}
+
+/**
+ * Report or remove orphaned notes, depending on what the caller asked for.
+ *
+ * Left visible rather than silent when pruning is off: the orphans accumulate
+ * every time the agent rewords a title, and a user who cannot see that
+ * happening cannot decide whether to act on it.
+ *
+ * @param context Method context used to delete resources and log.
+ * @param project Vault subfolder name.
+ * @param atlasDir Absolute path of this project's folder in the vault.
+ * @param notes Notes written by the current run.
+ * @param prune Whether to delete the orphans rather than just report them.
+ */
+async function reconcileOrphans(
+  context: Ctx,
+  project: string,
+  atlasDir: string,
+  notes: readonly z.infer<typeof NoteSchema>[],
+  prune: boolean,
+): Promise<void> {
+  const orphans = await findOrphans(
+    atlasDir,
+    project,
+    new Set(notes.map((n) => n.path)),
+  );
+  if (orphans.length === 0) return;
+
+  if (!prune) {
+    context.logger.warning(
+      "{count} note(s) from a previous run are no longer produced and were left in place: {slugs}. Pass prune=true to remove them.",
+      { count: orphans.length, slugs: orphans.map((o) => o.slug).join(", ") },
+    );
+    return;
+  }
+
+  const removed = await removeOrphans(context, project, orphans);
+  context.logger.info("Pruned {removed} orphaned note(s) from {folder}", {
+    removed,
+    folder: atlasDir,
+  });
 }
 
 /**
@@ -1376,7 +1550,7 @@ async function keepTranscript(
 /** Model definition for building Obsidian atlases from repos and diagrams. */
 export const model = {
   type: "@aaronge/obsidian-atlas",
-  version: "2026.08.25.1",
+  version: "2026.08.25.2",
   description:
     "Turn a Git repository or an architecture diagram into an illustrated, wikilinked Obsidian atlas.",
   globalArguments: GlobalArgsSchema,
@@ -1386,6 +1560,12 @@ export const model = {
       toVersion: "2026.08.25.1",
       description:
         "Add optional maxBudgetUsd spend cap; existing arguments are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.25.2",
+      description:
+        "Add force and prune method arguments; global arguments are unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1537,9 +1717,9 @@ export const model = {
           // commit. The notes on disk are verified too: matching data with a
           // missing vault folder means the notes were removed, and skipping
           // then would leave the user with nothing.
+          const previous = await previousAtlas(context, project);
           if (!args.force) {
-            const previous = await alreadyCharted(context, project, commit);
-            if (previous) {
+            if (await isChartedAt(previous, commit)) {
               context.logger.info(
                 "Already charted at commit {commit}; skipping. Pass force=true to re-chart.",
                 { commit: commit.slice(0, 7) },
@@ -1566,6 +1746,14 @@ export const model = {
             atlas,
             { source: repoUrl, sourceKind: "repo", project, commit },
             context.globalArgs,
+          );
+
+          await reconcileOrphans(
+            context,
+            project,
+            `${context.globalArgs.vaultRoot}/${context.globalArgs.folder}/${project}`,
+            notes,
+            args.prune,
           );
 
           const handles = [surveyHandle];
@@ -1670,6 +1858,14 @@ export const model = {
             atlas,
             { source: args.image, sourceKind: "diagram", project },
             context.globalArgs,
+          );
+
+          await reconcileOrphans(
+            context,
+            project,
+            `${context.globalArgs.vaultRoot}/${context.globalArgs.folder}/${project}`,
+            notes,
+            args.prune,
           );
 
           const handles = [

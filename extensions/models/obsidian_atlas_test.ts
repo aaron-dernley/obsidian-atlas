@@ -15,6 +15,7 @@ import {
   countMermaid,
   extractCliText,
   extractJsonObject,
+  findOrphans,
   formatProgress,
   model,
   normalizeRepoUrl,
@@ -412,8 +413,14 @@ async function makeFakeClaude(
   return path;
 }
 
-/** A minimal valid atlas document as the agent would return it. */
-function atlasDocument(body: string): string {
+/**
+ * A minimal valid atlas document as the agent would return it.
+ *
+ * @param body Markdown body for the first note.
+ * @param secondSlug Slug of the second note, varied to simulate the agent
+ *   rewording a title between runs and so orphaning the old file.
+ */
+function atlasDocument(body: string, secondSlug = "details"): string {
   return JSON.stringify({
     title: "Fixture",
     summary: "A fixture project.",
@@ -424,10 +431,10 @@ function atlasDocument(body: string): string {
         title: "Overview",
         kind: "overview",
         body,
-        links: ["details"],
+        links: [secondSlug],
       },
       {
-        slug: "details",
+        slug: secondSlug,
         title: "Details",
         kind: "component",
         body: "Details body.",
@@ -469,6 +476,7 @@ interface Captured {
   resources: Array<{ specName: string; name: string; data: Record<string, unknown> }>;
   files: Array<{ specName: string; name: string; content: string }>;
   logs: string[];
+  deleted: string[];
 }
 
 /**
@@ -484,6 +492,7 @@ function captureContext(
   const resources: Captured["resources"] = [];
   const files: Captured["files"] = [];
   const logs: string[] = [];
+  const deleted: string[] = [];
   const render = (msg: string, props?: Record<string, unknown>) =>
     msg.replace(/\{(\w+)\}/g, (_, k) => String(props?.[k] ?? `{${k}}`));
 
@@ -491,6 +500,7 @@ function captureContext(
     resources,
     files,
     logs,
+    deleted,
     context: {
       globalArgs,
       logger: {
@@ -507,6 +517,10 @@ function captureContext(
         return Promise.resolve({ name });
       },
       readResource: (name: string) => Promise.resolve(stored[name] ?? null),
+      deleteResource: (name: string) => {
+        deleted.push(name);
+        return Promise.resolve();
+      },
       createFileWriter: (specName: string, name: string) => ({
         writeText: (content: string) => {
           files.push({ specName, name, content });
@@ -622,7 +636,7 @@ Deno.test("chart renders notes into the vault and records every artifact", async
   try {
     const cap = captureContext(testGlobals(vault, bin));
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       cap.context,
     );
 
@@ -674,7 +688,7 @@ Deno.test("chart recovers when the agent emits a raw control character", async (
   try {
     const cap = captureContext(testGlobals(vault, bin));
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       cap.context,
     );
 
@@ -694,7 +708,7 @@ Deno.test("chart keeps the transcript when the agent output is unusable", async 
   try {
     const cap = captureContext(testGlobals(vault, bin));
     const err = await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       cap.context,
     ).then(() => null, (e: unknown) => e);
 
@@ -736,7 +750,7 @@ Deno.test("chart reports an exhausted budget as its own failure", async () => {
   try {
     const cap = captureContext(testGlobals(vault, bin, { maxBudgetUsd: 1.5 }));
     const err = await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       cap.context,
     ).then(() => null, (e: unknown) => e);
 
@@ -759,7 +773,7 @@ Deno.test("chartDiagram rejects a missing or unsupported image", async () => {
     const cap = captureContext(testGlobals(vault, "claude"));
 
     const missing = await model.methods.chartDiagram.execute(
-      { image: `${dir}/nope.png` },
+      { image: `${dir}/nope.png`, prune: false },
       cap.context,
     ).then(() => null, (e: unknown) => e);
     assertStringIncludes((missing as Error).message, "Diagram image not found");
@@ -767,7 +781,7 @@ Deno.test("chartDiagram rejects a missing or unsupported image", async () => {
     const bad = `${dir}/notes.txt`;
     await Deno.writeTextFile(bad, "x");
     const unsupported = await model.methods.chartDiagram.execute(
-      { image: bad },
+      { image: bad, prune: false },
       cap.context,
     ).then(() => null, (e: unknown) => e);
     assertStringIncludes(
@@ -794,7 +808,7 @@ Deno.test("chart skips the spend when the commit is already charted", async () =
     const good = await makeFakeClaude(stream(atlasDocument("Body.")));
     const first = captureContext(testGlobals(vault, good));
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       first.context,
     );
     const charted = first.resources.find((r) => r.specName === "atlas")!.data;
@@ -805,7 +819,7 @@ Deno.test("chart skips the spend when the commit is already charted", async () =
       "atlas-fixture": charted,
     });
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       second.context,
     );
 
@@ -835,7 +849,7 @@ Deno.test("chart re-charts on force, a new commit, or missing notes", async () =
     const globals = testGlobals(vault, bin);
     const baseline = captureContext(globals);
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       baseline.context,
     );
     const charted = baseline.resources.find((r) =>
@@ -845,7 +859,7 @@ Deno.test("chart re-charts on force, a new commit, or missing notes", async () =
     // force overrides a matching commit.
     const forced = captureContext(globals, { "atlas-fixture": charted });
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: true },
+      { repo, project: "fixture", keepClone: false, force: true, prune: false },
       forced.context,
     );
     assertEquals(forced.resources.some((r) => r.specName === "atlas"), true);
@@ -855,7 +869,7 @@ Deno.test("chart re-charts on force, a new commit, or missing notes", async () =
       "atlas-fixture": { ...charted, commit: "0".repeat(40) },
     });
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       moved.context,
     );
     assertEquals(moved.resources.some((r) => r.specName === "atlas"), true);
@@ -865,7 +879,7 @@ Deno.test("chart re-charts on force, a new commit, or missing notes", async () =
     await Deno.remove(`${vault}/Atlas/fixture`, { recursive: true });
     const emptied = captureContext(globals, { "atlas-fixture": charted });
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       emptied.context,
     );
     assertEquals(emptied.resources.some((r) => r.specName === "atlas"), true);
@@ -884,7 +898,7 @@ Deno.test("notes record the commit they describe", async () => {
   try {
     const cap = captureContext(testGlobals(vault, bin));
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false, force: false },
+      { repo, project: "fixture", keepClone: false, force: false, prune: false },
       cap.context,
     );
 
@@ -922,7 +936,7 @@ Deno.test("chartDiagram exposes only the image, not its folder", async () => {
   try {
     const cap = captureContext(testGlobals(vault, bin));
     await model.methods.chartDiagram.execute(
-      { image: `${desktop}/arch.png`, project: "diagram" },
+      { image: `${desktop}/arch.png`, project: "diagram", prune: false },
       cap.context,
     );
 
@@ -941,5 +955,144 @@ Deno.test("chartDiagram exposes only the image, not its folder", async () => {
     await Deno.remove(desktop, { recursive: true });
     await Deno.remove(vault, { recursive: true });
     await Deno.remove(binDir, { recursive: true });
+  }
+});
+
+Deno.test("findOrphans claims only notes this model wrote", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const note = (project: string) =>
+    `---\ntitle: "T"\natlas-project: ${JSON.stringify(project)}\n---\n\n# T\n`;
+  try {
+    await Deno.writeTextFile(`${dir}/kept.md`, note("fixture"));
+    await Deno.writeTextFile(`${dir}/orphan.md`, note("fixture"));
+    // None of the following belong to this project and must survive.
+    await Deno.writeTextFile(`${dir}/my-own-notes.md`, "# Mine\n");
+    await Deno.writeTextFile(`${dir}/other-project.md`, note("elsewhere"));
+    await Deno.writeTextFile(`${dir}/data.json`, "{}");
+    // A note that merely quotes the marker in its prose, without frontmatter.
+    await Deno.writeTextFile(
+      `${dir}/quoting.md`,
+      `# Docs\n\nWe set atlas-project: "fixture" in frontmatter.\n`,
+    );
+    await Deno.mkdir(`${dir}/subfolder`);
+    await Deno.writeTextFile(`${dir}/subfolder/nested.md`, note("fixture"));
+
+    const orphans = await findOrphans(
+      dir,
+      "fixture",
+      new Set([`${dir}/kept.md`]),
+    );
+    assertEquals(orphans, [{ slug: "orphan", path: `${dir}/orphan.md` }]);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("findOrphans returns nothing for a folder that is not there", async () => {
+  assertEquals(await findOrphans("/nonexistent/atlas/dir", "x", new Set()), []);
+});
+
+Deno.test("chart reports orphaned notes but leaves them alone by default", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const first = await makeFakeClaude(stream(atlasDocument("Body.", "details")));
+  // The agent rewords the second note, so its slug — and its filename — change.
+  const second = await makeFakeClaude(
+    stream(atlasDocument("Body.", "finer-details")),
+  );
+  try {
+    const globals = testGlobals(vault, first);
+    const before = captureContext(globals);
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: true, prune: false },
+      before.context,
+    );
+    const charted = before.resources.find((r) => r.specName === "atlas")!.data;
+    await Deno.stat(`${vault}/Atlas/fixture/details.md`);
+
+    const after = captureContext(testGlobals(vault, second), {
+      "atlas-fixture": charted,
+    });
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: true, prune: false },
+      after.context,
+    );
+
+    // The orphan is still there, and the user was told about it by name.
+    await Deno.stat(`${vault}/Atlas/fixture/details.md`);
+    await Deno.stat(`${vault}/Atlas/fixture/finer-details.md`);
+    assertEquals(after.deleted, []);
+    const warned = after.logs.find((l) => l.includes("no longer produced"));
+    assertEquals(typeof warned, "string");
+    assertStringIncludes(warned!, "details");
+
+    await Deno.remove(first.slice(0, first.lastIndexOf("/")), {
+      recursive: true,
+    });
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(second.slice(0, second.lastIndexOf("/")), {
+      recursive: true,
+    });
+  }
+});
+
+Deno.test("chart with prune removes the orphan and its stale resource", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const first = await makeFakeClaude(stream(atlasDocument("Body.", "details")));
+  const second = await makeFakeClaude(
+    stream(atlasDocument("Body.", "finer-details")),
+  );
+  try {
+    const before = captureContext(testGlobals(vault, first));
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: true, prune: true },
+      before.context,
+    );
+    const charted = before.resources.find((r) => r.specName === "atlas")!.data;
+
+    // A file the model never wrote must survive the prune untouched.
+    const handwritten = `${vault}/Atlas/fixture/my-own-notes.md`;
+    await Deno.writeTextFile(handwritten, "mine");
+
+    const after = captureContext(testGlobals(vault, second), {
+      "atlas-fixture": charted,
+    });
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: true, prune: true },
+      after.context,
+    );
+
+    // The orphan is gone, along with the resource that described it.
+    assertEquals(
+      await Deno.stat(`${vault}/Atlas/fixture/details.md`).then(
+        () => true,
+        () => false,
+      ),
+      false,
+      "the orphaned note should have been deleted",
+    );
+    assertEquals(after.deleted, ["note-fixture-details"]);
+    assertEquals(
+      after.logs.some((l) => l.includes("Pruned 1 orphaned note")),
+      true,
+    );
+
+    // Current notes and anything the user wrote themselves are untouched.
+    await Deno.stat(`${vault}/Atlas/fixture/overview.md`);
+    await Deno.stat(`${vault}/Atlas/fixture/finer-details.md`);
+    assertEquals(await Deno.readTextFile(handwritten), "mine");
+
+    await Deno.remove(first.slice(0, first.lastIndexOf("/")), {
+      recursive: true,
+    });
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(second.slice(0, second.lastIndexOf("/")), {
+      recursive: true,
+    });
   }
 });

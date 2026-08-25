@@ -43,10 +43,12 @@ swamp model method run atlas chart \
   --input ref=develop \
   --input project=thing-develop
 
-# Re-charting the same commit costs nothing. Force it when you want a redo.
+# Re-charting the same commit costs nothing. Force it when you want a redo,
+# and prune to clear out notes the agent no longer produces.
 swamp model method run atlas chart \
   --input repo=denoland/deno \
-  --input force=true
+  --input force=true \
+  --input prune=true
 
 # Interpret an architecture diagram instead of a repository. The agent is given
 # the image and nothing else — not the folder it happens to live in.
@@ -90,6 +92,10 @@ tags:
 | `survey`       | Clone a repo and record its structure. Deterministic, no LLM, no cost.                                              |
 | `chart`        | Clone, have Claude explain it, render the atlas into the vault. Skips the agent when the commit is already charted. |
 | `chartDiagram` | Interpret a diagram image and write the explanation into the vault.                                                 |
+
+Both charting methods take `prune=true` to delete notes from earlier runs that
+they no longer produce, and `chart` takes `force=true` to re-chart a commit it
+has already covered.
 
 ## Global arguments
 
@@ -175,17 +181,23 @@ re-charts when the commit has moved, when you pass `force=true`, or when the
 notes have gone missing from the vault, so a deleted folder can never leave you
 stranded with data that claims the work is done.
 
-Beyond that there is no incremental update, and two things follow:
+Otherwise a re-chart overwrites the notes in place, and two things follow:
 
-- A note whose title changes enough to change its slug leaves the old file
-  behind. Nothing is deleted from your vault, so stale notes have to be removed
-  by hand — a deliberate choice, since silently deleting files from a vault you
-  own is worse than leaving an orphan. Because every note carries
-  `atlas-commit`, you can find them:
-  `TABLE atlas-commit FROM #atlas WHERE atlas-commit != "<current>"`.
+- **Renamed notes leave orphans.** The agent rewords titles between runs, and a
+  reworded title means a new slug and so a new filename. The old file stays. By
+  default the run names the notes it no longer produces and leaves them where
+  they are; `prune=true` deletes them. Nothing is removed unless you ask.
 - Notes are written before the run's data artifacts, so a failure in between can
   leave markdown on disk with no matching `note` resource. Re-running repairs
   it.
+
+Pruning works out what belongs to it from frontmatter, not from remembering what
+it wrote last time. A note carrying this project's `atlas-project` marker that
+the current run did not produce is stale, and goes along with the `note`
+resource describing it. A file without that marker was written by you and is
+never touched; neither is anything in a subfolder. Reading the folder rather
+than a stored list also means orphans left by earlier runs are caught, so a
+vault that has already drifted heals on the next prune.
 
 If the agent's output turns out to be unusable the run fails, but the raw event
 stream is still kept as a `transcript` artifact, because by then you have
