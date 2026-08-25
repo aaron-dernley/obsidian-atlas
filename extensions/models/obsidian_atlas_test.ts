@@ -16,6 +16,7 @@ import {
   extractCliText,
   extractJsonObject,
   formatProgress,
+  model,
   normalizeRepoUrl,
   projectNameFromUrl,
   renderNote,
@@ -339,5 +340,442 @@ Deno.test("surveyTree summarises a tree and skips ignored dirs", async () => {
     );
   } finally {
     await Deno.remove(root, { recursive: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Method-level tests
+//
+// These exercise the real methods end to end without network access or spend:
+// the repository is a local git repo, and the Claude CLI is a shell script that
+// prints a canned NDJSON stream. That covers the streaming, parsing, rendering
+// and failure paths that the pure-helper tests cannot reach.
+// ---------------------------------------------------------------------------
+
+/** Global arguments with every default resolved, as the engine would pass them. */
+function testGlobals(
+  vaultRoot: string,
+  claudeBin: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    vaultRoot,
+    folder: "Atlas",
+    claudeBin,
+    permissionMode: "dontAsk",
+    timeoutSeconds: 900,
+    ...extra,
+  };
+}
+
+/** Create a small git repository on disk and return its path. */
+async function makeGitRepo(): Promise<string> {
+  const root = await Deno.makeTempDir({ prefix: "atlas-src-" });
+  await Deno.writeTextFile(`${root}/package.json`, '{"name":"fixture"}');
+  await Deno.writeTextFile(`${root}/index.ts`, "export const a = 1;\n");
+  const git = async (...args: string[]) => {
+    const { success, stderr } = await new Deno.Command("git", {
+      args,
+      cwd: root,
+      stdout: "null",
+      stderr: "piped",
+    }).output();
+    if (!success) throw new Error(new TextDecoder().decode(stderr));
+  };
+  await git("init", "-q", "-b", "main");
+  await git("config", "user.email", "test@example.com");
+  await git("config", "user.name", "Test");
+  await git("add", "-A");
+  await git("commit", "-q", "-m", "fixture");
+  return root;
+}
+
+/**
+ * Write an executable stand-in for the Claude CLI that prints `lines`.
+ *
+ * @param lines NDJSON event lines the fake CLI should emit on stdout.
+ * @param exitCode Exit status for the fake process.
+ * @returns Path to the executable.
+ */
+async function makeFakeClaude(
+  lines: string[],
+  exitCode = 0,
+): Promise<string> {
+  const dir = await Deno.makeTempDir({ prefix: "atlas-bin-" });
+  const path = `${dir}/claude`;
+  const payload = lines.join("\n");
+  await Deno.writeTextFile(
+    path,
+    `#!/bin/sh\ncat <<'STREAM_EOF'\n${payload}\nSTREAM_EOF\nexit ${exitCode}\n`,
+  );
+  await Deno.chmod(path, 0o755);
+  return path;
+}
+
+/** A minimal valid atlas document as the agent would return it. */
+function atlasDocument(body: string): string {
+  return JSON.stringify({
+    title: "Fixture",
+    summary: "A fixture project.",
+    tags: ["Fixture"],
+    notes: [
+      {
+        slug: "overview",
+        title: "Overview",
+        kind: "overview",
+        body,
+        links: ["details"],
+      },
+      {
+        slug: "details",
+        title: "Details",
+        kind: "component",
+        body: "Details body.",
+        links: ["overview", "missing"],
+      },
+    ],
+  });
+}
+
+/** Build a fake event stream whose result event carries `resultText`. */
+function stream(resultText: string, costUsd = 0.42): string[] {
+  return [
+    JSON.stringify({ type: "system", subtype: "init" }),
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "looking" },
+          { type: "tool_use", name: "Read", input: {} },
+          { type: "tool_use", name: "Grep", input: {} },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: resultText,
+      total_cost_usd: costUsd,
+      num_turns: 1,
+    }),
+  ];
+}
+
+/** Captured writes and logs from a stubbed method context. */
+interface Captured {
+  // deno-lint-ignore no-explicit-any
+  context: any;
+  resources: Array<{ specName: string; name: string; data: Record<string, unknown> }>;
+  files: Array<{ specName: string; name: string; content: string }>;
+  logs: string[];
+}
+
+/**
+ * Build a method context that records what the method writes and logs.
+ *
+ * @param globalArgs Resolved global arguments for the run.
+ * @returns The context plus the arrays it appends to.
+ */
+function captureContext(globalArgs: Record<string, unknown>): Captured {
+  const resources: Captured["resources"] = [];
+  const files: Captured["files"] = [];
+  const logs: string[] = [];
+  const render = (msg: string, props?: Record<string, unknown>) =>
+    msg.replace(/\{(\w+)\}/g, (_, k) => String(props?.[k] ?? `{${k}}`));
+
+  return {
+    resources,
+    files,
+    logs,
+    context: {
+      globalArgs,
+      logger: {
+        info: (m: string, p?: Record<string, unknown>) => logs.push(render(m, p)),
+        warning: (m: string, p?: Record<string, unknown>) =>
+          logs.push(render(m, p)),
+      },
+      writeResource: (
+        specName: string,
+        name: string,
+        data: Record<string, unknown>,
+      ) => {
+        resources.push({ specName, name, data });
+        return Promise.resolve({ name });
+      },
+      createFileWriter: (specName: string, name: string) => ({
+        writeText: (content: string) => {
+          files.push({ specName, name, content });
+          return Promise.resolve({ name });
+        },
+      }),
+    },
+  };
+}
+
+Deno.test("vault-exists check passes for a directory and fails otherwise", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const file = `${dir}/not-a-dir`;
+  await Deno.writeTextFile(file, "x");
+  try {
+    const check = model.checks["vault-exists"];
+    assertEquals(check.labels, ["policy"]);
+
+    assertEquals(
+      (await check.execute({ globalArgs: { vaultRoot: dir } as never })).pass,
+      true,
+    );
+
+    const onFile = await check.execute({
+      globalArgs: { vaultRoot: file } as never,
+    });
+    assertEquals(onFile.pass, false);
+    assertStringIncludes(onFile.errors?.[0] ?? "", "not a directory");
+
+    const missing = await check.execute({
+      globalArgs: { vaultRoot: `${dir}/nope` } as never,
+    });
+    assertEquals(missing.pass, false);
+    assertStringIncludes(missing.errors?.[0] ?? "", "does not exist");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("survey clones a repo, writes a conforming resource, and cleans up", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const before = await countTempDirs();
+  try {
+    const cap = captureContext(testGlobals(vault, "claude"));
+    await model.methods.survey.execute(
+      { repo, keepClone: false },
+      cap.context,
+    );
+
+    assertEquals(cap.resources.length, 1);
+    const [written] = cap.resources;
+    assertEquals(written.specName, "survey");
+    assertEquals(written.name, "survey-" + slugify(repo.split("/").pop()!));
+
+    // Every field the survey spec declares must be populated.
+    for (
+      const field of [
+        "source",
+        "sourceKind",
+        "ref",
+        "commit",
+        "project",
+        "fileCount",
+        "totalBytes",
+        "truncated",
+        "languages",
+        "signalFiles",
+        "topLevel",
+        "surveyedAt",
+      ]
+    ) {
+      assertEquals(
+        field in written.data,
+        true,
+        `survey resource is missing ${field}`,
+      );
+    }
+    assertEquals(written.data.fileCount, 2);
+    assertEquals(written.data.truncated, false);
+    assertEquals(written.data.sourceKind, "repo");
+    assertEquals(written.data.ref, "default");
+    assertEquals((written.data.commit as string).length, 40);
+
+    // The clone and the temp directory holding it are both gone.
+    assertEquals(await countTempDirs(), before);
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+  }
+});
+
+/** Count leftover atlas-* clone directories in the system temp directory. */
+async function countTempDirs(): Promise<number> {
+  const tmp = await Deno.makeTempDir({ prefix: "atlas-probe-" });
+  const parent = tmp.slice(0, tmp.lastIndexOf("/"));
+  await Deno.remove(tmp);
+  let n = 0;
+  for await (const e of Deno.readDir(parent)) {
+    if (e.isDirectory && e.name.startsWith("atlas-") && !e.name.startsWith("atlas-src-") &&
+      !e.name.startsWith("atlas-bin-") && !e.name.startsWith("atlas-vault-") &&
+      !e.name.startsWith("atlas-test-") && !e.name.startsWith("atlas-probe-")) n++;
+  }
+  return n;
+}
+
+Deno.test("chart renders notes into the vault and records every artifact", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const bin = await makeFakeClaude(
+    stream(atlasDocument("Overview body.\n\n```mermaid\nflowchart TD\n A-->B\n```")),
+  );
+  try {
+    const cap = captureContext(testGlobals(vault, bin));
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false },
+      cap.context,
+    );
+
+    const specs = cap.resources.map((r) => r.specName);
+    assertEquals(specs, ["survey", "atlas", "note", "note"]);
+    assertEquals(cap.files.length, 1);
+    assertEquals(cap.files[0].specName, "transcript");
+
+    const atlas = cap.resources[1].data;
+    assertEquals(atlas.project, "fixture");
+    assertEquals(atlas.folder, "Atlas/fixture");
+    assertEquals(atlas.noteCount, 2);
+    assertEquals(atlas.diagramCount, 1);
+
+    // Notes actually exist on disk with frontmatter and resolved wikilinks.
+    const overview = await Deno.readTextFile(
+      `${vault}/Atlas/fixture/overview.md`,
+    );
+    assertStringIncludes(overview, 'atlas-project: "fixture"');
+    assertStringIncludes(overview, "```mermaid");
+    assertStringIncludes(overview, "[[details|Details]]");
+    await Deno.stat(`${vault}/Atlas/fixture/details.md`);
+
+    // The dangling link the agent invented is dropped, not rendered.
+    const details = await Deno.readTextFile(
+      `${vault}/Atlas/fixture/details.md`,
+    );
+    assertEquals(details.includes("missing"), false);
+    assertEquals(cap.resources[3].data.links, ["overview"]);
+
+    // Progress was reported, ending with the cost the CLI declared.
+    const progress = cap.logs.filter((l) => l.includes("turn"));
+    assertEquals(progress.length > 0, true, "expected a progress line");
+    assertStringIncludes(progress[progress.length - 1], "$0.42");
+    assertStringIncludes(progress[progress.length - 1], "1 file read");
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(bin.slice(0, bin.lastIndexOf("/")), { recursive: true });
+  }
+});
+
+Deno.test("chart recovers when the agent emits a raw control character", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  // A literal newline inside the JSON string — invalid JSON, complete answer.
+  // This is the failure that killed a real run after several minutes.
+  const bin = await makeFakeClaude(stream(atlasDocument("line one\nline two")));
+  try {
+    const cap = captureContext(testGlobals(vault, bin));
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false },
+      cap.context,
+    );
+
+    const body = await Deno.readTextFile(`${vault}/Atlas/fixture/overview.md`);
+    assertStringIncludes(body, "line one\nline two");
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(bin.slice(0, bin.lastIndexOf("/")), { recursive: true });
+  }
+});
+
+Deno.test("chart keeps the transcript when the agent output is unusable", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const bin = await makeFakeClaude(stream("I could not work out what this is."));
+  try {
+    const cap = captureContext(testGlobals(vault, bin));
+    const err = await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false },
+      cap.context,
+    ).then(() => null, (e: unknown) => e);
+
+    assertEquals(err instanceof Error, true);
+    assertStringIncludes((err as Error).message, "could not be parsed as JSON");
+
+    // The spend is not thrown away: the transcript survives the failure.
+    assertEquals(cap.files.length, 1);
+    assertEquals(cap.files[0].specName, "transcript");
+    assertStringIncludes(cap.files[0].content, "total_cost_usd");
+    assertEquals(
+      cap.logs.some((l) => l.includes("transcript kept")),
+      true,
+    );
+
+    // No atlas or note resources were written from a failed run.
+    assertEquals(
+      cap.resources.filter((r) => r.specName !== "survey").length,
+      0,
+    );
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(bin.slice(0, bin.lastIndexOf("/")), { recursive: true });
+  }
+});
+
+Deno.test("chart reports an exhausted budget as its own failure", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const bin = await makeFakeClaude([
+    JSON.stringify({
+      type: "result",
+      is_error: true,
+      total_cost_usd: 1.51,
+      terminal_reason: "budget_exhausted",
+    }),
+  ], 1);
+  try {
+    const cap = captureContext(testGlobals(vault, bin, { maxBudgetUsd: 1.5 }));
+    const err = await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false },
+      cap.context,
+    ).then(() => null, (e: unknown) => e);
+
+    const message = (err as Error).message;
+    assertStringIncludes(message, "maxBudgetUsd cap of $1.5");
+    assertStringIncludes(message, "$1.51");
+    // Still debuggable.
+    assertEquals(cap.files.length, 1);
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(bin.slice(0, bin.lastIndexOf("/")), { recursive: true });
+  }
+});
+
+Deno.test("chartDiagram rejects a missing or unsupported image", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "atlas-img-" });
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  try {
+    const cap = captureContext(testGlobals(vault, "claude"));
+
+    const missing = await model.methods.chartDiagram.execute(
+      { image: `${dir}/nope.png` },
+      cap.context,
+    ).then(() => null, (e: unknown) => e);
+    assertStringIncludes((missing as Error).message, "Diagram image not found");
+
+    const bad = `${dir}/notes.txt`;
+    await Deno.writeTextFile(bad, "x");
+    const unsupported = await model.methods.chartDiagram.execute(
+      { image: bad },
+      cap.context,
+    ).then(() => null, (e: unknown) => e);
+    assertStringIncludes(
+      (unsupported as Error).message,
+      "Unsupported image type",
+    );
+
+    // Nothing was written for either rejection.
+    assertEquals(cap.resources.length, 0);
+    assertEquals(cap.files.length, 0);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
   }
 });
