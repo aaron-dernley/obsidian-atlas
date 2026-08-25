@@ -95,6 +95,7 @@ tags:
 | `workDir`        | temp dir   | Where repositories are cloned                    |
 | `permissionMode` | `dontAsk`  | Permission mode passed to the CLI                |
 | `timeoutSeconds` | `900`      | Per-invocation wall-clock limit                  |
+| `maxBudgetUsd`   | _unset_    | Hard spend cap in USD for a single run           |
 
 ## How it works
 
@@ -115,6 +116,23 @@ wikilinks are dropped, path segments are checked for traversal, and each note is
 written with frontmatter. Raw CLI output is retained for seven days as a
 `transcript` file artifact for debugging.
 
+### Progress while it runs
+
+The agent decides for itself when it has read enough, so there is no honest
+completion percentage to show. Instead the model streams the CLI's event log and
+reports what it can actually measure, every fifteen seconds:
+
+```text
+Exploring 118 files. Progress below is measured activity, not a completion estimate.
+  0m15s · 3 turns · 7 files read · 4 searches
+  0m30s · 5 turns · 19 files read · 9 searches
+  3m32s · 16 turns · 41 files read · 22 searches · $0.87
+```
+
+The dollar figure is the CLI's own reported spend, which arrives with the final
+event — so it appears on the last line rather than ticking up throughout. Set
+`maxBudgetUsd` to have the CLI stop the run itself once that ceiling is hit.
+
 ### Prerequisites
 
 - `git` on `PATH`
@@ -127,8 +145,10 @@ written with frontmatter. Raw CLI output is retained for seven days as a
 
 `chart` spends tokens against your Claude account — roughly proportional to how
 much of the repository the agent reads. Run `survey` first to see what it is
-about to take on. The model does not currently do incremental updates: charting
-the same project again overwrites the previous notes in that folder.
+about to take on, and set `maxBudgetUsd` if you want a hard ceiling. Charting
+`chalk/chalk` — 118 files, eight notes out — cost $0.87 and took three and a
+half minutes. The model does not currently do incremental updates: charting the
+same project again overwrites the previous notes in that folder.
 
 ## License
 

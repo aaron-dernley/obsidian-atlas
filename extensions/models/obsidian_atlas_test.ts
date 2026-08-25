@@ -9,10 +9,13 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import {
+  type AgentProgress,
+  applyStreamEvent,
   assertSafeSegment,
   countMermaid,
   extractCliText,
   extractJsonObject,
+  formatProgress,
   normalizeRepoUrl,
   projectNameFromUrl,
   renderNote,
@@ -20,6 +23,17 @@ import {
   surveyTree,
   yamlString,
 } from "./obsidian_atlas.ts";
+
+/** Fresh zeroed counters for progress tests. */
+function emptyProgress(): AgentProgress {
+  return {
+    elapsedSeconds: 0,
+    turns: 0,
+    filesRead: 0,
+    searches: 0,
+    costUsd: null,
+  };
+}
 
 Deno.test("slugify normalises titles", () => {
   assertEquals(slugify("Data Flow & Storage"), "data-flow-storage");
@@ -122,6 +136,29 @@ Deno.test("extractJsonObject throws when there is no object", () => {
   );
 });
 
+Deno.test("extractJsonObject repairs raw control characters in strings", () => {
+  // The exact failure seen charting chalk/chalk: a literal newline inside a
+  // markdown body, which is invalid JSON but a complete, usable answer.
+  const raw = '{"title":"Chalk","body":"line one\nline two\ttabbed"}';
+  assertThrows(() => JSON.parse(raw));
+  assertEquals(extractJsonObject(raw), {
+    title: "Chalk",
+    body: "line one\nline two\ttabbed",
+  });
+
+  // An already-escaped body must survive untouched, including literal
+  // backslash-n sequences that are not newlines at all.
+  assertEquals(
+    extractJsonObject('{"body":"escaped \\n stays \\\\n literal"}'),
+    { body: "escaped \n stays \\n literal" },
+  );
+
+  // Control characters with no short escape fall back to \\uXXXX.
+  assertEquals(extractJsonObject('{"body":"bell\x07here"}'), {
+    body: "bell\x07here",
+  });
+});
+
 Deno.test("countMermaid counts fences", () => {
   assertEquals(countMermaid("a\n```mermaid\nflowchart\n```\nb"), 1);
   assertEquals(countMermaid("```mermaid\nx\n```\n```mermaid\ny\n```"), 2);
@@ -178,6 +215,97 @@ Deno.test("renderNote omits the Related section when nothing resolves", () => {
     },
   );
   assertEquals(md.includes("## Related"), false);
+});
+
+Deno.test("formatProgress renders measured counters, never a percentage", () => {
+  assertEquals(
+    formatProgress({
+      elapsedSeconds: 151,
+      turns: 14,
+      filesRead: 47,
+      searches: 0,
+      costUsd: 2.1,
+    }),
+    "2m31s · 14 turns · 47 files read · $2.10",
+  );
+  // Zero-padded seconds, singulars, searches included, cost still unknown.
+  assertEquals(
+    formatProgress({
+      elapsedSeconds: 65,
+      turns: 1,
+      filesRead: 1,
+      searches: 3,
+      costUsd: null,
+    }),
+    "1m05s · 1 turn · 1 file read · 3 searches",
+  );
+  assertEquals(
+    formatProgress(emptyProgress()),
+    "0m00s · 0 turns · 0 files read",
+  );
+});
+
+Deno.test("applyStreamEvent counts turns and tool use", () => {
+  const p = emptyProgress();
+  applyStreamEvent({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "looking" },
+        { type: "tool_use", name: "Read", input: {} },
+        { type: "tool_use", name: "Grep", input: {} },
+        { type: "tool_use", name: "Read", input: {} },
+      ],
+    },
+  }, p);
+
+  assertEquals(p.turns, 1);
+  assertEquals(p.filesRead, 2);
+  assertEquals(p.searches, 1);
+});
+
+Deno.test("applyStreamEvent picks up cost from the result event", () => {
+  const p = emptyProgress();
+  applyStreamEvent({ type: "result", total_cost_usd: 2.27 }, p);
+  assertEquals(p.costUsd, 2.27);
+});
+
+Deno.test("applyStreamEvent keeps the turn count monotonic", () => {
+  const p = emptyProgress();
+  const assistant = { type: "assistant", message: { content: [] } };
+  for (let i = 0; i < 20; i++) applyStreamEvent(assistant, p);
+
+  // The CLI's own num_turns counts turns differently and is typically lower
+  // than the assistant messages seen; taking it would make the final progress
+  // line report fewer turns than the line before it.
+  applyStreamEvent({ type: "result", total_cost_usd: 0.87, num_turns: 16 }, p);
+  assertEquals(p.turns, 20);
+  assertEquals(p.costUsd, 0.87);
+});
+
+Deno.test("applyStreamEvent ignores junk without throwing", () => {
+  const p = emptyProgress();
+  for (
+    const junk of [null, undefined, 42, "text", [], {}, { type: "system" }]
+  ) {
+    applyStreamEvent(junk, p);
+  }
+  // Non-assistant, non-result events must not move any counter.
+  assertEquals(p, emptyProgress());
+});
+
+Deno.test("applyStreamEvent tolerates a malformed assistant message", () => {
+  const p = emptyProgress();
+  applyStreamEvent({ type: "assistant" }, p);
+  applyStreamEvent(
+    { type: "assistant", message: { content: "not-an-array" } },
+    p,
+  );
+  applyStreamEvent({ type: "assistant", message: { content: [null, 7] } }, p);
+  // Turns still counted; no tool counters corrupted.
+  assertEquals(p.turns, 3);
+  assertEquals(p.filesRead, 0);
+  assertEquals(p.searches, 0);
 });
 
 Deno.test("surveyTree summarises a tree and skips ignored dirs", async () => {

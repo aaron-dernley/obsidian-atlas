@@ -136,6 +136,18 @@ const IMAGE_EXTS: ReadonlySet<string> = new Set([
 /** Maximum files walked during a survey, to bound work on very large repos. */
 const MAX_SURVEY_FILES = 20000;
 
+/** Seconds between progress lines emitted while the agent is exploring. */
+const PROGRESS_INTERVAL_SECONDS = 15;
+
+/** JSON escapes for the control characters a model is most likely to emit raw. */
+const CONTROL_ESCAPES: Readonly<Record<string, string>> = {
+  "\n": "\\n",
+  "\r": "\\r",
+  "\t": "\\t",
+  "\b": "\\b",
+  "\f": "\\f",
+};
+
 // ---------------------------------------------------------------------------
 // Global arguments
 // ---------------------------------------------------------------------------
@@ -171,6 +183,13 @@ const GlobalArgsSchema = z.object({
     .positive()
     .default(900)
     .describe("Maximum wall-clock seconds for a single Claude CLI invocation."),
+  maxBudgetUsd: z
+    .number()
+    .positive()
+    .optional()
+    .describe(
+      "Hard spend cap in USD for a single charting run. Unset means no cap.",
+    ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -382,6 +401,11 @@ export function extractCliText(stdout: string): string {
 /**
  * Extract a JSON object from model text that may be fenced or prose-wrapped.
  *
+ * Long markdown bodies tempt the model into emitting a literal newline or tab
+ * inside a JSON string, which is invalid JSON. The brace scanner already tracks
+ * whether it is inside a string, so it escapes those control characters as it
+ * goes rather than discarding an otherwise complete answer.
+ *
  * @param text Assistant text expected to contain one JSON object.
  * @returns The parsed object.
  * @throws If no balanced JSON object can be located or parsed.
@@ -393,7 +417,7 @@ export function extractJsonObject(text: string): unknown {
   try {
     return JSON.parse(candidate);
   } catch {
-    // Fall through to brace scanning.
+    // Fall through to brace scanning, which also repairs control characters.
   }
 
   const start = candidate.indexOf("{");
@@ -405,11 +429,24 @@ export function extractJsonObject(text: string): unknown {
     );
   }
 
+  const out: string[] = [];
   let depth = 0;
   let inString = false;
   let escaped = false;
   for (let i = start; i < candidate.length; i++) {
     const ch = candidate[i];
+
+    if (inString && !escaped) {
+      const code = ch.charCodeAt(0);
+      if (code < 0x20) {
+        out.push(
+          CONTROL_ESCAPES[ch] ?? `\\u${code.toString(16).padStart(4, "0")}`,
+        );
+        continue;
+      }
+    }
+    out.push(ch);
+
     if (escaped) {
       escaped = false;
       continue;
@@ -426,9 +463,7 @@ export function extractJsonObject(text: string): unknown {
     if (ch === "{") depth++;
     if (ch === "}") {
       depth--;
-      if (depth === 0) {
-        return JSON.parse(candidate.slice(start, i + 1));
-      }
+      if (depth === 0) return JSON.parse(out.join(""));
     }
   }
   throw new Error("Unbalanced JSON object in model output");
@@ -691,11 +726,107 @@ async function run(
 }
 
 /**
+ * An agent invocation that consumed budget but produced no usable atlas.
+ *
+ * Carries the raw event stream so the caller can still write the transcript. A
+ * run that has already been paid for should stay debuggable, and the failures
+ * this represents — malformed JSON, a schema mismatch, an exhausted budget —
+ * are exactly the ones worth inspecting after the fact.
+ */
+export class AgentOutputError extends Error {
+  /** The raw NDJSON event stream captured before the failure. */
+  readonly raw: string;
+
+  constructor(message: string, raw: string) {
+    super(message);
+    this.name = "AgentOutputError";
+    this.raw = raw;
+  }
+}
+
+/** Live counters describing how far a Claude CLI run has got. */
+export interface AgentProgress {
+  /** Whole seconds since the invocation started. */
+  elapsedSeconds: number;
+  /** Assistant turns observed so far. */
+  turns: number;
+  /** Files opened with the Read tool. */
+  filesRead: number;
+  /** Grep and Glob invocations, i.e. searches rather than reads. */
+  searches: number;
+  /** Running cost in USD, only known once the CLI reports it. */
+  costUsd: number | null;
+}
+
+/**
+ * Format progress counters as a single human-readable line.
+ *
+ * Every figure is measured rather than estimated — there is no percentage
+ * because the agent decides when it has read enough, so no honest denominator
+ * exists.
+ *
+ * @param p Counters captured from the event stream.
+ * @returns A line such as `2m31s · 14 turns · 47 files read · $2.10`.
+ */
+export function formatProgress(p: AgentProgress): string {
+  const m = Math.floor(p.elapsedSeconds / 60);
+  const s = p.elapsedSeconds % 60;
+  const parts = [
+    `${m}m${String(s).padStart(2, "0")}s`,
+    `${p.turns} turn${p.turns === 1 ? "" : "s"}`,
+    `${p.filesRead} file${p.filesRead === 1 ? "" : "s"} read`,
+  ];
+  if (p.searches > 0) parts.push(`${p.searches} searches`);
+  if (p.costUsd !== null) parts.push(`$${p.costUsd.toFixed(2)}`);
+  return parts.join(" · ");
+}
+
+/**
+ * Fold one streamed CLI event into the running counters.
+ *
+ * Unknown event shapes are ignored rather than throwing, so a change to the
+ * CLI's stream format degrades the progress display instead of failing the run.
+ *
+ * @param event A single parsed NDJSON event from the CLI.
+ * @param p Counters to update in place.
+ */
+export function applyStreamEvent(event: unknown, p: AgentProgress): void {
+  if (typeof event !== "object" || event === null) return;
+  const e = event as Record<string, unknown>;
+
+  if (typeof e.total_cost_usd === "number") p.costUsd = e.total_cost_usd;
+
+  // The result event also carries num_turns, but it counts turns differently
+  // and is usually lower than the assistant messages we have already seen.
+  // Taking it would make the final line report fewer turns than the line
+  // before it, so we keep our own monotonic tally instead.
+  if (e.type !== "assistant") return;
+  p.turns++;
+
+  const message = e.message as { content?: unknown } | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return;
+
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const b = block as { type?: unknown; name?: unknown };
+    if (b.type !== "tool_use") continue;
+    if (b.name === "Read") p.filesRead++;
+    else if (b.name === "Grep" || b.name === "Glob") p.searches++;
+  }
+}
+
+/**
  * Invoke the Claude CLI read-only and return the validated atlas document.
+ *
+ * Streams NDJSON events so the caller can report live progress. The agent
+ * decides when it has explored enough, so the counters are activity indicators
+ * rather than a completion percentage.
  *
  * @param prompt The full instruction sent to the agent.
  * @param allowDir Directory the agent is permitted to read.
  * @param globals Model global arguments.
+ * @param onProgress Called periodically with the latest counters.
  * @param signal Cancellation signal from the method context.
  * @returns The parsed and validated agent response plus raw stdout.
  */
@@ -703,12 +834,14 @@ async function askClaude(
   prompt: string,
   allowDir: string,
   globals: GlobalArgs,
+  onProgress: (p: AgentProgress) => void,
   signal?: AbortSignal,
 ): Promise<{ atlas: AgentAtlas; raw: string }> {
   const args = [
     "--print",
     "--output-format",
-    "json",
+    "stream-json",
+    "--verbose",
     "--permission-mode",
     globals.permissionMode,
     "--add-dir",
@@ -721,32 +854,166 @@ async function askClaude(
     "--disable-slash-commands",
   ];
   if (globals.model) args.push("--model", globals.model);
+  if (globals.maxBudgetUsd !== undefined) {
+    args.push("--max-budget-usd", String(globals.maxBudgetUsd));
+  }
   args.push(prompt);
 
-  const result = await run(globals.claudeBin, args, {
-    cwd: allowDir,
-    signal,
-    timeoutSeconds: globals.timeoutSeconds,
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(),
+    globals.timeoutSeconds * 1000,
+  );
+  const onParentAbort = () => controller.abort();
+  signal?.addEventListener("abort", onParentAbort);
 
-  if (result.code !== 0) {
-    throw new Error(
-      `Claude CLI exited ${result.code}: ${
-        (result.stderr || result.stdout).slice(0, 800)
+  const started = Date.now();
+  const progress: AgentProgress = {
+    elapsedSeconds: 0,
+    turns: 0,
+    filesRead: 0,
+    searches: 0,
+    costUsd: null,
+  };
+  const lines: string[] = [];
+  let resultEvent: Record<string, unknown> | null = null;
+
+  let child: Deno.ChildProcess;
+  try {
+    child = new Deno.Command(globals.claudeBin, {
+      args,
+      cwd: allowDir,
+      stdout: "piped",
+      stderr: "piped",
+      signal: controller.signal,
+    }).spawn();
+  } catch (err) {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onParentAbort);
+    if (err instanceof Deno.errors.NotFound) {
+      throw new Error(
+        `Executable not found: ${globals.claudeBin}. Install the Claude CLI or set claudeBin.`,
+      );
+    }
+    throw err;
+  }
+
+  // Drain stderr concurrently, otherwise a full pipe buffer deadlocks the child.
+  const stderrPromise = new Response(child.stderr).text();
+
+  // Report on a ticker rather than on stream activity: the agent routinely goes
+  // minutes between events while composing its final answer, and that silence
+  // is exactly when the caller most needs to know the run is still alive.
+  const ticker = setInterval(() => {
+    progress.elapsedSeconds = Math.floor((Date.now() - started) / 1000);
+    onProgress({ ...progress });
+  }, PROGRESS_INTERVAL_SECONDS * 1000);
+
+  try {
+    const reader = child.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const chunk = buffer.split("\n");
+      buffer = chunk.pop() ?? "";
+      for (const line of chunk) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
+        lines.push(trimmed);
+
+        let event: unknown;
+        try {
+          event = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        applyStreamEvent(event, progress);
+        if (
+          typeof event === "object" && event !== null &&
+          (event as { type?: unknown }).type === "result"
+        ) {
+          resultEvent = event as Record<string, unknown>;
+        }
+      }
+    }
+    if (buffer.trim().length > 0) lines.push(buffer.trim());
+
+    const status = await child.status;
+    const stderr = await stderrPromise;
+
+    clearInterval(ticker);
+    progress.elapsedSeconds = Math.floor((Date.now() - started) / 1000);
+    onProgress({ ...progress });
+
+    if (!status.success) {
+      // A cap that was asked for and then hit is an expected outcome, not a
+      // mystery failure, so it gets its own message and keeps the transcript.
+      if (resultEvent?.terminal_reason === "budget_exhausted") {
+        throw new AgentOutputError(
+          `Claude CLI stopped: the maxBudgetUsd cap of $${globals.maxBudgetUsd} was reached${
+            progress.costUsd === null
+              ? ""
+              : ` after spending $${progress.costUsd.toFixed(2)}`
+          }. Raise maxBudgetUsd or chart a smaller repository.`,
+          lines.join("\n"),
+        );
+      }
+      throw new Error(
+        `Claude CLI exited ${status.code}: ${
+          (stderr || lines.join("\n")).slice(0, 800)
+        }`,
+      );
+    }
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(
+        `Claude CLI timed out after ${globals.timeoutSeconds}s or was cancelled`,
+      );
+    }
+    throw err;
+  } finally {
+    clearInterval(ticker);
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onParentAbort);
+  }
+
+  const raw = lines.join("\n");
+  if (!resultEvent) {
+    throw new AgentOutputError(
+      `Claude CLI stream ended without a result event. Last output: ${
+        raw.slice(-500)
       }`,
+      raw,
     );
   }
 
-  const text = extractCliText(result.stdout);
-  const parsed = AgentAtlasSchema.safeParse(extractJsonObject(text));
+  let document: unknown;
+  try {
+    document = extractJsonObject(extractCliText(JSON.stringify(resultEvent)));
+  } catch (err) {
+    throw new AgentOutputError(
+      `Claude CLI returned output that could not be parsed as JSON: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      raw,
+    );
+  }
+
+  const parsed = AgentAtlasSchema.safeParse(document);
   if (!parsed.success) {
-    throw new Error(
+    throw new AgentOutputError(
       `Claude CLI returned a document that did not match the atlas schema: ${
         JSON.stringify(parsed.error.issues).slice(0, 800)
       }`,
+      raw,
     );
   }
-  return { atlas: parsed.data, raw: result.stdout };
+  return { atlas: parsed.data, raw };
 }
 
 /** Shape of the JSON contract restated to the agent in every prompt. */
@@ -998,13 +1265,57 @@ const DiagramArgsSchema = z.object({
     .describe("Optional context about what the diagram shows."),
 });
 
+/**
+ * Persist the transcript of a failed agent invocation, then rethrow.
+ *
+ * The spend has already happened by the time the output turns out to be
+ * unusable, so the raw event stream is written as a `transcript` artifact
+ * before the method fails. Without this the most common failure — a malformed
+ * document after several minutes of exploration — leaves nothing to inspect.
+ *
+ * @param err The error raised by `askClaude`.
+ * @param context Method context used to write the artifact and log.
+ * @param name Instance name for the transcript artifact.
+ * @returns Never — always rethrows `err`.
+ */
+async function keepTranscript(
+  err: unknown,
+  context: Ctx,
+  name: string,
+): Promise<never> {
+  if (err instanceof AgentOutputError) {
+    try {
+      await context.createFileWriter("transcript", name).writeText(err.raw);
+      context.logger.warning(
+        "Agent output was unusable; transcript kept as {name} for debugging",
+        { name },
+      );
+    } catch (writeErr) {
+      // Never let a failed diagnostic write mask the original failure.
+      context.logger.warning("Could not keep the transcript: {detail}", {
+        detail: writeErr instanceof Error ? writeErr.message : String(writeErr),
+      });
+    }
+  }
+  throw err;
+}
+
 /** Model definition for building Obsidian atlases from repos and diagrams. */
 export const model = {
   type: "@aaronge/obsidian-atlas",
-  version: "2026.08.21.1",
+  version: "2026.08.25.1",
   description:
     "Turn a Git repository or an architecture diagram into an illustrated, wikilinked Obsidian atlas.",
   globalArguments: GlobalArgsSchema,
+
+  upgrades: [
+    {
+      toVersion: "2026.08.25.1",
+      description:
+        "Add optional maxBudgetUsd spend cap; existing arguments are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     survey: {
@@ -1150,14 +1461,18 @@ export const model = {
             survey,
           );
 
-          context.logger.info("Asking Claude to explain {files} files", {
-            files: tree.fileCount,
-          });
+          context.logger.info(
+            "Exploring {files} files. Progress below is measured activity, not a completion estimate.",
+            { files: tree.fileCount },
+          );
           const { atlas, raw } = await askClaude(
             repoPrompt(survey, repoUrl, dir),
             dir,
             context.globalArgs,
+            (p) => context.logger.info("  {line}", { line: formatProgress(p) }),
             context.signal,
+          ).catch((err) =>
+            keepTranscript(err, context, `transcript-${project}`)
           );
 
           const notes = await writeAtlas(
@@ -1249,8 +1564,9 @@ export const model = {
           diagramPrompt(args.image, args.note),
           dir,
           context.globalArgs,
+          (p) => context.logger.info("  {line}", { line: formatProgress(p) }),
           context.signal,
-        );
+        ).catch((err) => keepTranscript(err, context, `transcript-${project}`));
 
         const notes = await writeAtlas(
           atlas,

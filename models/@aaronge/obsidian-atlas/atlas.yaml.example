@@ -23,5 +23,6 @@ globalArguments:
   # workDir: /tmp/atlas        # where repositories are cloned
   # permissionMode: dontAsk    # permission mode passed to the CLI
   # timeoutSeconds: 900        # per-invocation wall-clock limit
+  # maxBudgetUsd: 2.0          # hard spend cap for a single run; unset means none
 
 methods: {}
