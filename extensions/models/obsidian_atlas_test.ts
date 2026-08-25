@@ -477,7 +477,10 @@ interface Captured {
  * @param globalArgs Resolved global arguments for the run.
  * @returns The context plus the arrays it appends to.
  */
-function captureContext(globalArgs: Record<string, unknown>): Captured {
+function captureContext(
+  globalArgs: Record<string, unknown>,
+  stored: Record<string, Record<string, unknown>> = {},
+): Captured {
   const resources: Captured["resources"] = [];
   const files: Captured["files"] = [];
   const logs: string[] = [];
@@ -503,6 +506,7 @@ function captureContext(globalArgs: Record<string, unknown>): Captured {
         resources.push({ specName, name, data });
         return Promise.resolve({ name });
       },
+      readResource: (name: string) => Promise.resolve(stored[name] ?? null),
       createFileWriter: (specName: string, name: string) => ({
         writeText: (content: string) => {
           files.push({ specName, name, content });
@@ -618,7 +622,7 @@ Deno.test("chart renders notes into the vault and records every artifact", async
   try {
     const cap = captureContext(testGlobals(vault, bin));
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false },
+      { repo, project: "fixture", keepClone: false, force: false },
       cap.context,
     );
 
@@ -670,7 +674,7 @@ Deno.test("chart recovers when the agent emits a raw control character", async (
   try {
     const cap = captureContext(testGlobals(vault, bin));
     await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false },
+      { repo, project: "fixture", keepClone: false, force: false },
       cap.context,
     );
 
@@ -690,7 +694,7 @@ Deno.test("chart keeps the transcript when the agent output is unusable", async 
   try {
     const cap = captureContext(testGlobals(vault, bin));
     const err = await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false },
+      { repo, project: "fixture", keepClone: false, force: false },
       cap.context,
     ).then(() => null, (e: unknown) => e);
 
@@ -732,7 +736,7 @@ Deno.test("chart reports an exhausted budget as its own failure", async () => {
   try {
     const cap = captureContext(testGlobals(vault, bin, { maxBudgetUsd: 1.5 }));
     const err = await model.methods.chart.execute(
-      { repo, project: "fixture", keepClone: false },
+      { repo, project: "fixture", keepClone: false, force: false },
       cap.context,
     ).then(() => null, (e: unknown) => e);
 
@@ -777,5 +781,165 @@ Deno.test("chartDiagram rejects a missing or unsupported image", async () => {
   } finally {
     await Deno.remove(dir, { recursive: true });
     await Deno.remove(vault, { recursive: true });
+  }
+});
+
+Deno.test("chart skips the spend when the commit is already charted", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  // A CLI that must never run: if the skip fails, the test fails loudly.
+  const bin = await makeFakeClaude(["this would be a protocol violation"], 1);
+  try {
+    // First chart the project for real, using a working fake CLI.
+    const good = await makeFakeClaude(stream(atlasDocument("Body.")));
+    const first = captureContext(testGlobals(vault, good));
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: false },
+      first.context,
+    );
+    const charted = first.resources.find((r) => r.specName === "atlas")!.data;
+    assertEquals(typeof charted.commit, "string");
+
+    // Now re-chart with the previous atlas recorded and the same HEAD.
+    const second = captureContext(testGlobals(vault, bin), {
+      "atlas-fixture": charted,
+    });
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: false },
+      second.context,
+    );
+
+    // Only the survey is rewritten; no agent was invoked, nothing was spent.
+    assertEquals(second.resources.map((r) => r.specName), ["survey"]);
+    assertEquals(second.files.length, 0);
+    assertEquals(
+      second.logs.some((l) => l.includes("Already charted at commit")),
+      true,
+    );
+
+    await Deno.remove(good.slice(0, good.lastIndexOf("/")), {
+      recursive: true,
+    });
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(bin.slice(0, bin.lastIndexOf("/")), { recursive: true });
+  }
+});
+
+Deno.test("chart re-charts on force, a new commit, or missing notes", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const bin = await makeFakeClaude(stream(atlasDocument("Body.")));
+  try {
+    const globals = testGlobals(vault, bin);
+    const baseline = captureContext(globals);
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: false },
+      baseline.context,
+    );
+    const charted = baseline.resources.find((r) =>
+      r.specName === "atlas"
+    )!.data;
+
+    // force overrides a matching commit.
+    const forced = captureContext(globals, { "atlas-fixture": charted });
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: true },
+      forced.context,
+    );
+    assertEquals(forced.resources.some((r) => r.specName === "atlas"), true);
+
+    // A different recorded commit means the repo moved on.
+    const moved = captureContext(globals, {
+      "atlas-fixture": { ...charted, commit: "0".repeat(40) },
+    });
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: false },
+      moved.context,
+    );
+    assertEquals(moved.resources.some((r) => r.specName === "atlas"), true);
+
+    // Matching data but the notes are gone from the vault: charting again is
+    // the only way the caller ends up with notes.
+    await Deno.remove(`${vault}/Atlas/fixture`, { recursive: true });
+    const emptied = captureContext(globals, { "atlas-fixture": charted });
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: false },
+      emptied.context,
+    );
+    assertEquals(emptied.resources.some((r) => r.specName === "atlas"), true);
+    await Deno.stat(`${vault}/Atlas/fixture/overview.md`);
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(bin.slice(0, bin.lastIndexOf("/")), { recursive: true });
+  }
+});
+
+Deno.test("notes record the commit they describe", async () => {
+  const repo = await makeGitRepo();
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  const bin = await makeFakeClaude(stream(atlasDocument("Body.")));
+  try {
+    const cap = captureContext(testGlobals(vault, bin));
+    await model.methods.chart.execute(
+      { repo, project: "fixture", keepClone: false, force: false },
+      cap.context,
+    );
+
+    const commit =
+      cap.resources.find((r) => r.specName === "atlas")!.data.commit as string;
+    const note = await Deno.readTextFile(`${vault}/Atlas/fixture/overview.md`);
+    assertStringIncludes(note, `atlas-commit: "${commit}"`);
+  } finally {
+    await Deno.remove(repo, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(bin.slice(0, bin.lastIndexOf("/")), { recursive: true });
+  }
+});
+
+Deno.test("chartDiagram exposes only the image, not its folder", async () => {
+  const desktop = await Deno.makeTempDir({ prefix: "atlas-img-" });
+  const vault = await Deno.makeTempDir({ prefix: "atlas-vault-" });
+  // A secret sitting beside the diagram, as things do on a real desktop.
+  await Deno.writeTextFile(`${desktop}/tax-return.txt`, "private");
+  await Deno.writeTextFile(`${desktop}/arch.png`, "not-really-a-png");
+
+  // The fake CLI reports the directory it was granted, so the test can assert
+  // on what the agent could actually have read.
+  const binDir = await Deno.makeTempDir({ prefix: "atlas-bin-" });
+  const bin = `${binDir}/claude`;
+  const seen = `${binDir}/granted.txt`;
+  await Deno.writeTextFile(
+    bin,
+    `#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "--add-dir" ]; then shift; ls "$1" > ${seen}; fi\n  shift\ndone\ncat <<'STREAM_EOF'\n${
+      stream(atlasDocument("Body.")).join("\n")
+    }\nSTREAM_EOF\n`,
+  );
+  await Deno.chmod(bin, 0o755);
+
+  try {
+    const cap = captureContext(testGlobals(vault, bin));
+    await model.methods.chartDiagram.execute(
+      { image: `${desktop}/arch.png`, project: "diagram" },
+      cap.context,
+    );
+
+    const granted = await Deno.readTextFile(seen);
+    assertStringIncludes(granted, "arch.png");
+    assertEquals(
+      granted.includes("tax-return"),
+      false,
+      "the agent must not be able to see files beside the diagram",
+    );
+
+    // Provenance still points at the real file, not the staged copy.
+    const atlas = cap.resources.find((r) => r.specName === "atlas")!.data;
+    assertEquals(atlas.source, `${desktop}/arch.png`);
+  } finally {
+    await Deno.remove(desktop, { recursive: true });
+    await Deno.remove(vault, { recursive: true });
+    await Deno.remove(binDir, { recursive: true });
   }
 });

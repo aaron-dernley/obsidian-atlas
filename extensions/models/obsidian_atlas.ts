@@ -229,6 +229,8 @@ const NoteRefSchema = z.object({
 const AtlasSchema = z.object({
   source: z.string(),
   sourceKind: z.string(),
+  /** Resolved HEAD commit, present only for repository-sourced atlases. */
+  commit: z.string().optional(),
   project: z.string(),
   title: z.string(),
   summary: z.string(),
@@ -513,6 +515,8 @@ export interface RenderNoteMeta {
   project: string;
   /** ISO-8601 timestamp stamped into frontmatter. */
   generatedAt: string;
+  /** Commit the notes describe, for repository-sourced atlases. */
+  commit?: string;
   /** Atlas-wide tags applied to every note. */
   tags: readonly string[];
   /** Slug to title map used to resolve and label wikilinks. */
@@ -538,6 +542,9 @@ export function renderNote(note: AtlasNote, meta: RenderNoteMeta): string {
     `atlas-source: ${yamlString(meta.source)}`,
     `atlas-source-kind: ${yamlString(meta.sourceKind)}`,
     `atlas-kind: ${yamlString(note.kind)}`,
+    // Recorded so a vault query can tell which revision a note describes, and
+    // therefore which notes have gone stale.
+    ...(meta.commit ? [`atlas-commit: ${yamlString(meta.commit)}`] : []),
     `atlas-generated: ${yamlString(meta.generatedAt)}`,
     "tags:",
     ...tags.map((t) => `  - ${t}`),
@@ -1120,7 +1127,12 @@ ${JSON_CONTRACT}`;
  */
 async function writeAtlas(
   agent: AgentAtlas,
-  meta: { source: string; sourceKind: string; project: string },
+  meta: {
+    source: string;
+    sourceKind: string;
+    project: string;
+    commit?: string;
+  },
   globals: GlobalArgs,
 ): Promise<Array<z.infer<typeof NoteSchema>>> {
   const generatedAt = new Date().toISOString();
@@ -1149,6 +1161,7 @@ async function writeAtlas(
       source: meta.source,
       sourceKind: meta.sourceKind,
       project: meta.project,
+      commit: meta.commit,
       generatedAt,
       tags: agent.tags,
       titleBySlug,
@@ -1237,6 +1250,11 @@ interface Ctx {
     name: string,
     data: Record<string, unknown>,
   ) => Promise<{ name: string }>;
+  /** Reads back a previously written resource, or null when there is none. */
+  readResource?: (
+    name: string,
+    version?: number,
+  ) => Promise<Record<string, unknown> | null>;
   createFileWriter: (
     specName: string,
     name: string,
@@ -1263,6 +1281,12 @@ const ChartArgsSchema = z.object({
     .boolean()
     .default(false)
     .describe("Leave the clone on disk instead of deleting it."),
+  force: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Re-chart even when this project is already charted at the same commit.",
+    ),
 });
 
 const DiagramArgsSchema = z.object({
@@ -1276,6 +1300,43 @@ const DiagramArgsSchema = z.object({
     .optional()
     .describe("Optional context about what the diagram shows."),
 });
+
+/**
+ * Decide whether a project is already charted at a given commit.
+ *
+ * Both halves have to hold: the recorded atlas must be for the same commit,
+ * and every note it claims to have written must still be on disk. Data alone
+ * is not enough — if the vault folder was deleted or moved, skipping would
+ * leave the caller with no notes and no explanation.
+ *
+ * @param context Method context, whose `readResource` may be unavailable.
+ * @param project Vault subfolder name, used as the instance name suffix.
+ * @param commit Freshly resolved HEAD commit of the clone.
+ * @returns True when charting can safely be skipped.
+ */
+async function alreadyCharted(
+  context: Ctx,
+  project: string,
+  commit: string,
+): Promise<boolean> {
+  if (!context.readResource) return false;
+
+  const previous = await context.readResource(`atlas-${project}`).catch(
+    () => null,
+  );
+  if (!previous || previous.commit !== commit) return false;
+
+  const notes = previous.notes;
+  if (!Array.isArray(notes) || notes.length === 0) return false;
+
+  for (const note of notes) {
+    const path = (note as { path?: unknown }).path;
+    if (typeof path !== "string") return false;
+    const stat = await Deno.stat(path).catch(() => null);
+    if (!stat?.isFile) return false;
+  }
+  return true;
+}
 
 /**
  * Persist the transcript of a failed agent invocation, then rethrow.
@@ -1472,6 +1533,21 @@ export const model = {
             survey,
           );
 
+          // Charting costs real money, so don't pay it twice for the same
+          // commit. The notes on disk are verified too: matching data with a
+          // missing vault folder means the notes were removed, and skipping
+          // then would leave the user with nothing.
+          if (!args.force) {
+            const previous = await alreadyCharted(context, project, commit);
+            if (previous) {
+              context.logger.info(
+                "Already charted at commit {commit}; skipping. Pass force=true to re-chart.",
+                { commit: commit.slice(0, 7) },
+              );
+              return { dataHandles: [surveyHandle] };
+            }
+          }
+
           context.logger.info(
             "Exploring {files} files. Progress below is measured activity, not a completion estimate.",
             { files: tree.fileCount },
@@ -1488,7 +1564,7 @@ export const model = {
 
           const notes = await writeAtlas(
             atlas,
-            { source: repoUrl, sourceKind: "repo", project },
+            { source: repoUrl, sourceKind: "repo", project, commit },
             context.globalArgs,
           );
 
@@ -1497,6 +1573,7 @@ export const model = {
             await context.writeResource("atlas", `atlas-${project}`, {
               source: repoUrl,
               sourceKind: "repo",
+              commit,
               project,
               title: atlas.title,
               summary: atlas.summary,
@@ -1560,68 +1637,83 @@ export const model = {
           );
         }
 
-        const dir = args.image.slice(0, args.image.lastIndexOf("/")) || ".";
         const filename = args.image.slice(args.image.lastIndexOf("/") + 1);
         const project = slugify(
           args.project ?? filename.slice(0, filename.lastIndexOf(".")),
         );
 
-        context.logger.info("Interpreting diagram {image}", {
-          image: args.image,
-        });
-        const { atlas, raw } = await askClaude(
-          diagramPrompt(args.image, args.note),
-          dir,
-          context.globalArgs,
-          (p) => context.logger.info("  {line}", { line: formatProgress(p) }),
-          context.signal,
-        ).catch((err) => keepTranscript(err, context, `transcript-${project}`));
+        // Stage the image in a directory of its own. Pointing --add-dir at the
+        // folder the image happens to live in would hand the agent read access
+        // to everything else sitting beside it — a diagram on your desktop
+        // should not expose your desktop.
+        const stageDir = await Deno.makeTempDir({ prefix: "atlas-diagram-" });
+        const staged = `${stageDir}/${filename}`;
+        await Deno.copyFile(args.image, staged);
 
-        const notes = await writeAtlas(
-          atlas,
-          { source: args.image, sourceKind: "diagram", project },
-          context.globalArgs,
-        );
-
-        const handles = [
-          await context.writeResource("atlas", `atlas-${project}`, {
-            source: args.image,
-            sourceKind: "diagram",
-            project,
-            title: atlas.title,
-            summary: atlas.summary,
-            folder: `${context.globalArgs.folder}/${project}`,
-            noteCount: notes.length,
-            diagramCount: notes.reduce((n, x) => n + x.diagrams, 0),
-            notes: notes.map((n) => ({
-              slug: n.slug,
-              title: n.title,
-              kind: n.kind,
-              path: n.path,
-            })),
-            generatedAt: new Date().toISOString(),
-          }),
-        ];
-        for (const note of notes) {
-          handles.push(
-            await context.writeResource(
-              "note",
-              `note-${project}-${note.slug}`,
-              note,
-            ),
+        try {
+          context.logger.info("Interpreting diagram {image}", {
+            image: args.image,
+          });
+          const { atlas, raw } = await askClaude(
+            diagramPrompt(staged, args.note),
+            stageDir,
+            context.globalArgs,
+            (p) => context.logger.info("  {line}", { line: formatProgress(p) }),
+            context.signal,
+          ).catch((err) =>
+            keepTranscript(err, context, `transcript-${project}`)
           );
-        }
-        handles.push(
-          await context
-            .createFileWriter("transcript", `transcript-${project}`)
-            .writeText(raw),
-        );
 
-        context.logger.info("Wrote {count} notes to {folder}", {
-          count: notes.length,
-          folder: `${context.globalArgs.folder}/${project}`,
-        });
-        return { dataHandles: handles };
+          // Provenance records where the diagram came from, not where it was
+          // staged, so the note frontmatter still points at the real file.
+          const notes = await writeAtlas(
+            atlas,
+            { source: args.image, sourceKind: "diagram", project },
+            context.globalArgs,
+          );
+
+          const handles = [
+            await context.writeResource("atlas", `atlas-${project}`, {
+              source: args.image,
+              sourceKind: "diagram",
+              project,
+              title: atlas.title,
+              summary: atlas.summary,
+              folder: `${context.globalArgs.folder}/${project}`,
+              noteCount: notes.length,
+              diagramCount: notes.reduce((n, x) => n + x.diagrams, 0),
+              notes: notes.map((n) => ({
+                slug: n.slug,
+                title: n.title,
+                kind: n.kind,
+                path: n.path,
+              })),
+              generatedAt: new Date().toISOString(),
+            }),
+          ];
+          for (const note of notes) {
+            handles.push(
+              await context.writeResource(
+                "note",
+                `note-${project}-${note.slug}`,
+                note,
+              ),
+            );
+          }
+          handles.push(
+            await context
+              .createFileWriter("transcript", `transcript-${project}`)
+              .writeText(raw),
+          );
+
+          context.logger.info("Wrote {count} notes to {folder}", {
+            count: notes.length,
+            folder: `${context.globalArgs.folder}/${project}`,
+          });
+          return { dataHandles: handles };
+        } finally {
+          await Deno.remove(stageDir, { recursive: true }).catch(() => {});
+        }
       },
     },
   },
