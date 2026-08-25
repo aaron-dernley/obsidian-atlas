@@ -899,7 +899,9 @@ async function askClaude(
   }
 
   // Drain stderr concurrently, otherwise a full pipe buffer deadlocks the child.
-  const stderrPromise = new Response(child.stderr).text();
+  // The catch matters: if the loop below throws, nothing awaits this promise,
+  // and a rejection with no handler would surface as an unrelated crash.
+  const stderrPromise = new Response(child.stderr).text().catch(() => "");
 
   // Report on a ticker rather than on stream activity: the agent routinely goes
   // minutes between events while composing its final answer, and that silence
@@ -1178,14 +1180,15 @@ async function writeAtlas(
  * @param ref Branch or tag to check out, if any.
  * @param globals Model global arguments.
  * @param signal Cancellation signal from the method context.
- * @returns The clone directory and resolved commit SHA.
+ * @returns The clone directory, resolved commit SHA, and a cleanup function.
  */
 async function cloneRepo(
   repoUrl: string,
   ref: string | undefined,
   globals: GlobalArgs,
   signal?: AbortSignal,
-): Promise<{ dir: string; commit: string }> {
+): Promise<{ dir: string; commit: string; cleanup: () => Promise<void> }> {
+  const ephemeralBase = globals.workDir === undefined;
   const base = globals.workDir ??
     (await Deno.makeTempDir({ prefix: "atlas-" }));
   await Deno.mkdir(base, { recursive: true });
@@ -1205,7 +1208,16 @@ async function cloneRepo(
   }
 
   const head = await run("git", ["rev-parse", "HEAD"], { cwd: dir, signal });
-  return { dir, commit: head.stdout.trim() || "unknown" };
+  return {
+    dir,
+    commit: head.stdout.trim() || "unknown",
+    cleanup: async () => {
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      // Only a temp directory this call created is ours to remove; a
+      // user-supplied workDir may hold clones from other runs.
+      if (ephemeralBase) await Deno.remove(base).catch(() => {});
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1362,7 @@ export const model = {
   checks: {
     "vault-exists": {
       description: "The configured Obsidian vault directory exists",
+      labels: ["policy"],
       execute: async (
         context: { globalArgs: GlobalArgs },
       ): Promise<{ pass: boolean; errors?: string[] }> => {
@@ -1389,7 +1402,7 @@ export const model = {
         const project = projectNameFromUrl(repoUrl);
         context.logger.info("Cloning {repo}", { repo: repoUrl });
 
-        const { dir, commit } = await cloneRepo(
+        const { dir, commit, cleanup } = await cloneRepo(
           repoUrl,
           args.ref,
           context.globalArgs,
@@ -1417,9 +1430,7 @@ export const model = {
           });
           return { dataHandles: [handle] };
         } finally {
-          if (!args.keepClone) {
-            await Deno.remove(dir, { recursive: true }).catch(() => {});
-          }
+          if (!args.keepClone) await cleanup();
         }
       },
     },
@@ -1436,7 +1447,7 @@ export const model = {
         const project = slugify(args.project ?? projectNameFromUrl(repoUrl));
         context.logger.info("Charting {repo}", { repo: repoUrl });
 
-        const { dir, commit } = await cloneRepo(
+        const { dir, commit, cleanup } = await cloneRepo(
           repoUrl,
           args.ref,
           context.globalArgs,
@@ -1522,9 +1533,7 @@ export const model = {
           });
           return { dataHandles: handles };
         } finally {
-          if (!args.keepClone) {
-            await Deno.remove(dir, { recursive: true }).catch(() => {});
-          }
+          if (!args.keepClone) await cleanup();
         }
       },
     },
