@@ -123,14 +123,22 @@ completion percentage to show. Instead the model streams the CLI's event log and
 reports what it can actually measure, every fifteen seconds:
 
 ```text
-Exploring 118 files. Progress below is measured activity, not a completion estimate.
-  0m15s · 3 turns · 7 files read · 4 searches
-  0m30s · 5 turns · 19 files read · 9 searches
-  3m32s · 16 turns · 41 files read · 22 searches · $0.87
+Exploring 29 files. Progress below is measured activity, not a completion estimate.
+  0m15s · 7 turns · 5 files read
+  0m30s · 15 turns · 11 files read
+  0m45s · 18 turns · 11 files read
+  ...
+  3m20s · 19 turns · 11 files read · $0.84
 ```
 
+Counters going quiet is normal and does not mean the run has stalled: the agent
+stops reading once it has seen enough and then spends a while composing its
+answer. The lines keep coming on a timer so you can tell the difference between
+thinking and hanging. A search count appears only when the agent uses Grep or
+Glob — the run above went straight to reading files.
+
 The dollar figure is the CLI's own reported spend, which arrives with the final
-event — so it appears on the last line rather than ticking up throughout. Set
+event, so it appears on the last line rather than ticking up throughout. Set
 `maxBudgetUsd` to have the CLI stop the run itself once that ceiling is hit.
 
 ### Prerequisites
@@ -146,9 +154,22 @@ event — so it appears on the last line rather than ticking up throughout. Set
 `chart` spends tokens against your Claude account — roughly proportional to how
 much of the repository the agent reads. Run `survey` first to see what it is
 about to take on, and set `maxBudgetUsd` if you want a hard ceiling. Charting
-`chalk/chalk` — 118 files, eight notes out — cost $0.87 and took three and a
-half minutes. The model does not currently do incremental updates: charting the
-same project again overwrites the previous notes in that folder.
+`chalk/chalk` — 29 files, nine notes out — cost $0.84 and took three and a half
+minutes.
+
+There is no incremental update. Charting a project again overwrites the notes in
+that folder, and three things follow from that:
+
+- A note whose title changed enough to change its slug leaves the old file
+  behind. Nothing is deleted from your vault, so stale notes have to be removed
+  by hand — a deliberate choice, since silently deleting files from a vault you
+  own is worse than leaving one orphan.
+- Notes are written before the run's data artifacts, so a failure in between can
+  leave markdown on disk with no matching `note` resource. Re-running repairs it.
+- If the agent's output turns out to be unusable, the run fails but the raw
+  event stream is still kept as a `transcript` artifact, because by then you have
+  already paid for it. `swamp data get <model> transcript-<project>` will show
+  you what came back.
 
 ## License
 
