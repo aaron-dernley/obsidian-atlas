@@ -408,13 +408,26 @@ export function extractCliText(stdout: string): string {
  * whether it is inside a string, so it escapes those control characters as it
  * goes rather than discarding an otherwise complete answer.
  *
+ * The outer fence is matched by its *opening* marker and the *last* ` ``` ` in
+ * the text, not the nearest closing one: note bodies legitimately embed their
+ * own fences (mermaid diagrams, shell examples), and a nearest-match would
+ * truncate the candidate at the first nested fence rather than the real end
+ * of the JSON object.
+ *
  * @param text Assistant text expected to contain one JSON object.
  * @returns The parsed object.
  * @throws If no balanced JSON object can be located or parsed.
  */
 export function extractJsonObject(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*\n([\s\S]*?)\n?```/);
-  const candidate = (fenced ? fenced[1] : text).trim();
+  const open = text.match(/```(?:json)?\s*\n/);
+  let candidate = text.trim();
+  if (open && open.index !== undefined) {
+    const contentStart = open.index + open[0].length;
+    const closeIndex = text.lastIndexOf("```");
+    if (closeIndex > contentStart) {
+      candidate = text.slice(contentStart, closeIndex).trim();
+    }
+  }
 
   try {
     return JSON.parse(candidate);
@@ -1550,7 +1563,7 @@ async function keepTranscript(
 /** Model definition for building Obsidian atlases from repos and diagrams. */
 export const model = {
   type: "@aaronge/obsidian-atlas",
-  version: "2026.08.25.2",
+  version: "2026.08.26.1",
   description:
     "Turn a Git repository or an architecture diagram into an illustrated, wikilinked Obsidian atlas.",
   globalArguments: GlobalArgsSchema,
@@ -1566,6 +1579,12 @@ export const model = {
       toVersion: "2026.08.25.2",
       description:
         "Add force and prune method arguments; global arguments are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.26.1",
+      description:
+        "Fix extractJsonObject truncating at a fence nested inside a note body; no schema or argument changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

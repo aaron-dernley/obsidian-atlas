@@ -130,6 +130,21 @@ Deno.test("extractJsonObject ignores braces inside strings", () => {
   );
 });
 
+Deno.test("extractJsonObject does not truncate at a fence nested inside a note body", () => {
+  // The real failure: the response is wrapped in one outer ```json fence, but
+  // a note body embeds its own ```mermaid fence (an *expected* part of the
+  // contract). A nearest-closing-fence match would stop at the nested one and
+  // hand back a truncated, unbalanced candidate.
+  const raw = "```json\n" +
+    '{"title":"T","summary":"s","tags":[],"notes":[{"slug":"a","title":"A",' +
+    '"kind":"overview","body":"See:\\n\\n```mermaid\\nflowchart TD\\n A-->B\\n```' +
+    '\\n\\nmore text","links":[]}]}\n' +
+    "```";
+  const result = extractJsonObject(raw) as { notes: Array<{ body: string }> };
+  assertStringIncludes(result.notes[0].body, "```mermaid");
+  assertStringIncludes(result.notes[0].body, "more text");
+});
+
 Deno.test("extractJsonObject throws when there is no object", () => {
   assertThrows(
     () => extractJsonObject("no json here"),

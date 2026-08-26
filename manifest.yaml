@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@aaronge/obsidian-atlas"
-version: "2026.08.25.2"
+version: "2026.08.26.1"
 description: "Turn a Git repository or an architecture diagram into an illustrated, wikilinked Obsidian atlas using the local Claude CLI."
 
 repository: https://github.com/aaron-dernley/obsidian-atlas
